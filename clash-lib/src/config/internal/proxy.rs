@@ -496,6 +496,31 @@ pub struct OutboundTailscale {
     pub ephemeral: bool,
 }
 
+#[cfg(feature = "tailscale")]
+impl OutboundTailscale {
+    /// Resolve a relative `state_dir` against `cwd` so that configs can use
+    /// portable relative paths (e.g. `state-dir: "tailscale"`) instead of
+    /// platform-specific absolute paths.
+    ///
+    /// `cwd` is normally the absolute directory containing the config file.
+    /// Relative `cwd` values (such as the default `.`) are made absolute
+    /// against the process working directory when possible, so the resolved
+    /// path does not depend on the working directory at open time.
+    ///
+    /// Because `state_dir` is a `String`, non-UTF-8 paths are converted
+    /// lossily; prefer a UTF-8 working directory to avoid silent corruption.
+    pub fn resolve_state_dir(&mut self, cwd: &std::path::Path) {
+        if let Some(ref state_dir) = self.state_dir {
+            let path = std::path::Path::new(state_dir);
+            if path.is_relative() {
+                let cwd =
+                    std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                self.state_dir = Some(cwd.join(path).to_string_lossy().into_owned());
+            }
+        }
+    }
+}
+
 #[cfg(feature = "ssh")]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
@@ -792,7 +817,7 @@ impl TryFrom<HashMap<String, Value>> for OutboundProxyProviderDef {
 mod tailscale_tests {
     use super::{OutboundProxyProtocol, OutboundTailscale};
     use serde_yaml::Value;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, path::Path};
 
     #[test]
     fn parse_tailscale_outbound_proxy_protocol() {
@@ -836,6 +861,137 @@ mod tailscale_tests {
             Some("https://controlplane.tailscale.com")
         );
         assert!(ephemeral);
+    }
+
+    fn parse_tailscale(yaml: &str) -> OutboundTailscale {
+        let OutboundProxyProtocol::Tailscale(config) =
+            serde_yaml::from_str(yaml).expect("should parse tailscale")
+        else {
+            panic!("expected tailscale config");
+        };
+        config
+    }
+
+    fn resolved_state_dir(config: &OutboundTailscale) -> &Path {
+        Path::new(
+            config
+                .state_dir
+                .as_deref()
+                .expect("state_dir should be resolved"),
+        )
+    }
+
+    #[test]
+    fn test_tailscale_resolve_relative_state_dir() {
+        let mut config = parse_tailscale(
+            r#"
+                name: ts
+                type: tailscale
+                state-dir: tailscale
+                ephemeral: false
+            "#,
+        );
+
+        // Use the platform temp dir so the assertion also holds on Windows,
+        // where joining a Unix-style path would use Windows semantics.
+        let cwd = std::env::temp_dir();
+        config.resolve_state_dir(&cwd);
+
+        let expected = cwd.join("tailscale");
+        assert_eq!(resolved_state_dir(&config), expected.as_path());
+    }
+
+    #[test]
+    fn test_tailscale_resolve_dot_prefixed_state_dir() {
+        let mut config = parse_tailscale(
+            r#"
+                name: ts
+                type: tailscale
+                state-dir: ./tailscale
+            "#,
+        );
+
+        let cwd = std::env::temp_dir();
+        config.resolve_state_dir(&cwd);
+
+        // Path equality normalizes the `./` component.
+        let expected = cwd.join("tailscale");
+        assert_eq!(resolved_state_dir(&config), expected.as_path());
+    }
+
+    #[test]
+    fn test_tailscale_resolve_trailing_separator_state_dir() {
+        let mut config = parse_tailscale(
+            r#"
+                name: ts
+                type: tailscale
+                state-dir: tailscale/
+            "#,
+        );
+
+        let cwd = std::env::temp_dir();
+        config.resolve_state_dir(&cwd);
+
+        // Path equality ignores the trailing separator.
+        let expected = cwd.join("tailscale");
+        assert_eq!(resolved_state_dir(&config), expected.as_path());
+    }
+
+    #[test]
+    fn test_tailscale_resolve_absolute_state_dir_unchanged() {
+        // Build the absolute path with the platform's own separator instead
+        // of hard-coding a Unix-style path.
+        let absolute = std::env::temp_dir().join("tailscale-state");
+        let mapping = HashMap::from([
+            ("name".to_owned(), Value::String("ts".to_owned())),
+            ("type".to_owned(), Value::String("tailscale".to_owned())),
+            (
+                "state-dir".to_owned(),
+                Value::String(absolute.to_string_lossy().into_owned()),
+            ),
+        ]);
+
+        let OutboundProxyProtocol::Tailscale(mut config) =
+            OutboundProxyProtocol::try_from(mapping)
+                .expect("should parse tailscale")
+        else {
+            panic!("expected tailscale config");
+        };
+
+        config.resolve_state_dir(&std::env::temp_dir().join("clash-cwd"));
+        assert_eq!(resolved_state_dir(&config), absolute.as_path());
+    }
+
+    #[test]
+    fn test_tailscale_resolve_none_state_dir_unchanged() {
+        let mut config = parse_tailscale(
+            r#"
+                name: ts
+                type: tailscale
+            "#,
+        );
+
+        config.resolve_state_dir(&std::env::temp_dir());
+        assert!(config.state_dir.is_none());
+    }
+
+    #[test]
+    fn test_tailscale_resolve_relative_cwd_becomes_absolute() {
+        let mut config = parse_tailscale(
+            r#"
+                name: ts
+                type: tailscale
+                state-dir: state
+            "#,
+        );
+
+        config.resolve_state_dir(Path::new("."));
+
+        let expected = std::env::current_dir()
+            .expect("process working directory")
+            .join("state");
+        assert_eq!(resolved_state_dir(&config), expected.as_path());
+        assert!(resolved_state_dir(&config).is_absolute());
     }
 }
 

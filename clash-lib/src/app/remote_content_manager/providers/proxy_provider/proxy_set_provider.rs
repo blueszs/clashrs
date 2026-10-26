@@ -68,12 +68,22 @@ pub struct ProxySetProvider {
 }
 
 impl ProxySetProvider {
+    /// Create a proxy-set provider.
+    ///
+    /// `cwd` is the directory used to resolve relative paths in provider
+    /// contents (currently Tailscale's `state-dir`). Pass `None` to leave
+    /// such paths unresolved, as tests do. The parameter remains in the
+    /// signature when the `tailscale` feature is disabled so that call sites
+    /// stay feature-independent.
     pub fn new(
         name: String,
         interval: Duration,
         vehicle: ThreadSafeProviderVehicle,
         hc: HealthCheck,
         registry: Option<OutboundHandlerRegistry>,
+        #[cfg_attr(not(feature = "tailscale"), allow(unused_variables))] cwd: Option<
+            std::path::PathBuf,
+        >,
     ) -> anyhow::Result<Self> {
         let hc = Arc::new(hc);
 
@@ -240,7 +250,10 @@ impl ProxySetProvider {
                                     Ok(Arc::new(h) as _)
                                 }
                                 #[cfg(feature = "tailscale")]
-                                OutboundProxyProtocol::Tailscale(tscfg) => {
+                                OutboundProxyProtocol::Tailscale(mut tscfg) => {
+                                    if let Some(ref cwd) = cwd {
+                                        tscfg.resolve_state_dir(cwd);
+                                    }
                                     let h: tailscale::Handler = tscfg.try_into()?;
                                     Ok(Arc::new(h) as _)
                                 }
@@ -417,6 +430,7 @@ proxies:
             Duration::from_secs(1),
             vehicle,
             hc,
+            None,
             None,
         )
         .unwrap();
